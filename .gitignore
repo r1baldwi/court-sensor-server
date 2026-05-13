@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+photos/
+status.json
+yolov8n.pt
+.DS_Store
+firmware/
