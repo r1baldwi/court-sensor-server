@@ -33,6 +33,16 @@ INPUT_SIZE = 640
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # allow any origin to read your API
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 # In-memory cache of the most recent annotated photo per court
 # This avoids writing to disk on Render (ephemeral filesystem)
 latest_photos = {}  # court_id -> bytes (annotated JPEG)
