@@ -174,7 +174,7 @@ def dashboard():
         </div>
         """
     html = f"""
-    <html><head><meta http-equiv="refresh" content="5"><title>Court status</title></head>
+    <html><head><meta http-equiv="refresh" content="120"><title>Court status</title></head>
     <body style="font-family:sans-serif;max-width:700px;margin:2em auto;">
       <h1>Court occupancy</h1>
       {rows or "<p>No data yet. Waiting for first upload...</p>"}
