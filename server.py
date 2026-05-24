@@ -1,31 +1,31 @@
 """
 Court Occupancy Detection Server
 Uses ONNX Runtime for lightweight YOLOv8 person detection.
-Designed to run on Render's free tier.
 """
 
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 import onnxruntime as ort
 import numpy as np
 import cv2
 import io, time, json, os
 from pathlib import Path
 
+# ---- Authentication tokens (from environment variables) ----
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
+API_TOKEN = os.environ.get("API_TOKEN", "")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
 # ---- Configuration ----
 STATUS_FILE = Path("status.json")
 MODEL_PATH = Path("yolov8n.onnx")
 PERSON_CLASS = 0
 CONF_THRESHOLD = 0.4
-KEEP_LAST_PHOTO = True   # keep most recent photo per court in memory only
+KEEP_LAST_PHOTO = True
 
-# ---- Model setup ----
 if not MODEL_PATH.exists():
-    raise FileNotFoundError(
-        f"Model file not found at {MODEL_PATH}. "
-        "Generate it locally with: "
-        "python -c \"from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx')\""
-    )
+    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 
 session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
@@ -33,19 +33,15 @@ INPUT_SIZE = 640
 
 app = FastAPI()
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # allow any origin to read your API
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# In-memory cache of the most recent annotated photo per court
-# This avoids writing to disk on Render (ephemeral filesystem)
-latest_photos = {}  # court_id -> bytes (annotated JPEG)
+latest_photos = {}
 
 
 def load_status():
@@ -119,7 +115,16 @@ def annotate(img_bgr, detections):
 
 
 @app.post("/api/court-photo")
-async def court_photo(request: Request, x_court_id: str = Header("court-1")):
+async def court_photo(
+    request: Request,
+    x_court_id: str = Header("court-1"),
+    x_chip_temp: str = Header(None),
+    x_device_token: str = Header(None),
+):
+    # AUTHENTICATION: cameras must provide the device token
+    if x_device_token != DEVICE_TOKEN or not DEVICE_TOKEN:
+        raise HTTPException(401, "unauthorized")
+
     body = await request.body()
     print(f"Received {len(body)} bytes from {x_court_id}")
 
@@ -138,7 +143,6 @@ async def court_photo(request: Request, x_court_id: str = Header("court-1")):
     person_count = len(detections)
     occupied = person_count > 0
 
-    # Annotate and keep in memory (not disk)
     if KEEP_LAST_PHOTO:
         annotated = annotate(img_bgr, detections)
         ok, jpeg_bytes = cv2.imencode(".jpg", annotated)
@@ -150,6 +154,7 @@ async def court_photo(request: Request, x_court_id: str = Header("court-1")):
         "occupied": occupied,
         "person_count": person_count,
         "updated_at": int(time.time()),
+        "chip_temp": float(x_chip_temp) if x_chip_temp else None,
     }
     save_status(status)
 
@@ -158,14 +163,18 @@ async def court_photo(request: Request, x_court_id: str = Header("court-1")):
 
 
 @app.get("/")
-def dashboard():
+def dashboard(token: str = ""):
+    # AUTHENTICATION: only you can see the debug dashboard
+    if token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized — append ?token=YOUR_ADMIN_TOKEN to the URL")
+    
     status = load_status()
     rows = ""
     for court, s in status.items():
         age = int(time.time()) - s["updated_at"]
         color = "#d4edda" if s["occupied"] else "#f8d7da"
         has_photo = court in latest_photos
-        img_tag = f'<img src="/latest/{court}" style="max-width:600px;">' if has_photo else ""
+        img_tag = f'<img src="/latest/{court}?token={token}" style="max-width:600px;">' if has_photo else ""
         rows += f"""
         <div style="background:{color};padding:1em;margin:1em 0;border-radius:8px;">
           <h2>{court}: {"OCCUPIED" if s["occupied"] else "free"}</h2>
@@ -184,17 +193,25 @@ def dashboard():
 
 
 @app.get("/latest/{court_id}")
-def latest_photo(court_id: str):
+def latest_photo(court_id: str, token: str = ""):
+    # AUTHENTICATION: photos require admin token
+    if token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    
     if court_id not in latest_photos:
         return Response(status_code=404)
     return Response(content=latest_photos[court_id], media_type="image/jpeg")
 
 
 @app.get("/api/status")
-def status():
+def status(x_api_token: str = Header(None)):
+    # AUTHENTICATION: bolt.new uses this — provide API token
+    if x_api_token != API_TOKEN or not API_TOKEN:
+        raise HTTPException(401, "unauthorized")
     return load_status()
 
 
 @app.get("/healthz")
 def health():
+    # Health check stays open — for Render's monitoring
     return {"ok": True}
