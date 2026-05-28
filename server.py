@@ -158,7 +158,7 @@ async def court_photo(
     }
     save_status(status)
 
-    print(f"  -> occupied={occupied}, persons={person_count}")
+    print(f"  -> occupied={occupied}, persons={person_count}, temp={x_chip_temp}")
     return {"ok": True, "occupied": occupied, "person_count": person_count}
 
 
@@ -179,6 +179,7 @@ def dashboard(token: str = ""):
         <div style="background:{color};padding:1em;margin:1em 0;border-radius:8px;">
           <h2>{court}: {"OCCUPIED" if s["occupied"] else "free"}</h2>
           <p>{s["person_count"]} person(s), {age}s ago</p>
+          <p>Chip temp: {s.get("chip_temp", "N/A")}°C</p>
           {img_tag}
         </div>
         """
