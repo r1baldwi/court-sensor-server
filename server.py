@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import onnxruntime as ort
 import numpy as np
 import cv2
-import io, time, json, os
+import io, time, json, os, zipfile
 from pathlib import Path
 
 # ---- Authentication tokens (from environment variables) ----
@@ -143,11 +143,28 @@ async def court_photo(
     person_count = len(detections)
     occupied = person_count > 0
 
+    # Keep most recent annotated photo in memory for dashboard
+    annotated_img = None
     if KEEP_LAST_PHOTO:
-        annotated = annotate(img_bgr, detections)
-        ok, jpeg_bytes = cv2.imencode(".jpg", annotated)
+        annotated_img = annotate(img_bgr, detections)
+        ok, jpeg_bytes = cv2.imencode(".jpg", annotated_img)
         if ok:
             latest_photos[x_court_id] = jpeg_bytes.tobytes()
+
+    # Save every photo for review (TESTING ONLY — disable via env var before production)
+    SAVE_PHOTOS = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
+    if SAVE_PHOTOS:
+        photos_dir = Path("photos") / x_court_id
+        photos_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        status_label = "occupied" if occupied else "free"
+        filename = f"{ts}_{status_label}_{person_count}p.jpg"
+        # Reuse annotated image if we already made it, else generate
+        if annotated_img is None:
+            annotated_img = annotate(img_bgr, detections)
+        ok, jpeg_bytes = cv2.imencode(".jpg", annotated_img)
+        if ok:
+            (photos_dir / filename).write_bytes(jpeg_bytes.tobytes())
 
     status = load_status()
     status[x_court_id] = {
@@ -183,10 +200,17 @@ def dashboard(token: str = ""):
           {img_tag}
         </div>
         """
+    
+    # Count saved photos for visibility
+    photos_path = Path("photos")
+    saved_count = sum(1 for _ in photos_path.rglob("*.jpg")) if photos_path.exists() else 0
+    save_status_text = f"<p><small>Photo saving: {'ON' if os.environ.get('SAVE_PHOTOS', 'false').lower() == 'true' else 'OFF'} — {saved_count} photos saved</small></p>"
+    
     html = f"""
     <html><head><meta http-equiv="refresh" content="120"><title>Court status</title></head>
     <body style="font-family:sans-serif;max-width:700px;margin:2em auto;">
       <h1>Court occupancy</h1>
+      {save_status_text}
       {rows or "<p>No data yet. Waiting for first upload...</p>"}
     </body></html>
     """
@@ -210,6 +234,55 @@ def status(x_api_token: str = Header(None)):
     if x_api_token != API_TOKEN or not API_TOKEN:
         raise HTTPException(401, "unauthorized")
     return load_status()
+
+
+@app.get("/admin/photos/download.zip")
+def download_all_photos(token: str = ""):
+    """Download all saved photos as a zip. Admin only."""
+    if token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    
+    photos_path = Path("photos")
+    if not photos_path.exists():
+        raise HTTPException(404, "no photos saved yet")
+    
+    zip_buffer = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for photo_file in photos_path.rglob("*.jpg"):
+            zf.write(photo_file, photo_file.relative_to(photos_path))
+            file_count += 1
+    
+    if file_count == 0:
+        raise HTTPException(404, "no photos found")
+    
+    zip_buffer.seek(0)
+    return Response(
+        content=zip_buffer.read(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=photos_{int(time.time())}.zip"}
+    )
+
+
+@app.get("/admin/photos/count")
+def count_photos(token: str = ""):
+    """Quick check of how many photos are saved. Admin only."""
+    if token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+    
+    photos_path = Path("photos")
+    if not photos_path.exists():
+        return {"total": 0, "by_court": {}}
+    
+    by_court = {}
+    total = 0
+    for court_dir in photos_path.iterdir():
+        if court_dir.is_dir():
+            count = sum(1 for _ in court_dir.glob("*.jpg"))
+            by_court[court_dir.name] = count
+            total += count
+    
+    return {"total": total, "by_court": by_court, "saving_enabled": os.environ.get("SAVE_PHOTOS", "false").lower() == "true"}
 
 
 @app.get("/healthz")
