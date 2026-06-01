@@ -211,31 +211,21 @@ async def court_photo(
     chip_temp_val = float(x_chip_temp) if x_chip_temp else None
 
     if not occupied:
-        if was_occupied:
-            # First "free" after "occupied" — start confirmation window
-            pending_free_confirm[x_court_id] = {"first_free_at": now}
-            print(f"  -> PENDING CONFIRM: first free reading for {x_court_id}, "
-                  f"holding status as occupied | temp={x_chip_temp}°C")
-            # Don't update status yet — return early keeping court as occupied
-            return {"ok": True, "occupied": False,
-                    "person_count": person_count,
-                    "status_updated": False,
-                    "message": "awaiting_confirmation"}
-
-        elif x_court_id in pending_free_confirm:
-            # Second "free" reading — check confirmation window
+        # Check for existing pending confirmation FIRST
+        if x_court_id in pending_free_confirm:
+            # We already have a pending confirmation — this is the second+ free reading
             first_free_at    = pending_free_confirm[x_court_id]["first_free_at"]
             time_since_first = now - first_free_at
 
             if time_since_first <= CONFIRM_WINDOW_SECONDS:
-                # Confirmed free — clear pending and fall through to update
+                # Confirmed free — clear pending and update status
                 print(f"  -> CONFIRMED FREE for {x_court_id} "
                       f"after {time_since_first}s | temp={x_chip_temp}°C")
                 del pending_free_confirm[x_court_id]
                 # Falls through to status update below
 
             else:
-                # Confirmation window expired — restart confirmation
+                # Confirmation window expired — restart
                 print(f"  -> CONFIRM WINDOW EXPIRED ({time_since_first}s) "
                       f"for {x_court_id} — restarting | temp={x_chip_temp}°C")
                 pending_free_confirm[x_court_id] = {"first_free_at": now}
@@ -243,8 +233,19 @@ async def court_photo(
                         "person_count": person_count,
                         "status_updated": False,
                         "message": "confirmation_window_expired_restarting"}
+
+        elif was_occupied:
+            # First "free" after "occupied" — start confirmation window
+            pending_free_confirm[x_court_id] = {"first_free_at": now}
+            print(f"  -> PENDING CONFIRM: first free reading for {x_court_id}, "
+                  f"holding status as occupied | temp={x_chip_temp}°C")
+            return {"ok": True, "occupied": False,
+                    "person_count": person_count,
+                    "status_updated": False,
+                    "message": "awaiting_confirmation"}
+
         else:
-            # Already in free state — normal update, no confirmation needed
+            # Already in free state — normal update
             pass
 
     else:
@@ -255,7 +256,6 @@ async def court_photo(
             del pending_free_confirm[x_court_id]
 
     # Normal status update
-    # Reached for: occupied, confirmed free, or already-free→still-free
     status[x_court_id] = {
         "occupied":     occupied,
         "person_count": person_count,
