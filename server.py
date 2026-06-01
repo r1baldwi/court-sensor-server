@@ -21,8 +21,14 @@ ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 STATUS_FILE    = Path("status.json")
 MODEL_PATH     = Path("yolov8n.onnx")
 PERSON_CLASS   = 0
-CONF_THRESHOLD = 0.3          # lowered from 0.4 for better sensitivity
+CONF_THRESHOLD = 0.3
 KEEP_LAST_PHOTO = True
+
+# ---- Confirmation logic state ----
+# Tracks first "free" reading per court for occupied→free confirmation
+# Structure: {court_id: {"first_free_at": unix_timestamp}}
+pending_free_confirm = {}
+CONFIRM_WINDOW_SECONDS = 45  # two free readings within this window = confirmed
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
@@ -105,10 +111,8 @@ def postprocess(output, scale, pad_top, pad_left, orig_shape):
 def annotate(img_bgr, detections, court_id="", timestamp=None):
     out = img_bgr.copy()
 
-    # Burn timestamp into image for review
     if timestamp:
         ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
-        # White text with black shadow for readability on any background
         cv2.putText(out, f"{court_id} | {ts_str}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
         cv2.putText(out, f"{court_id} | {ts_str}", (10, 25),
@@ -128,7 +132,7 @@ async def court_photo(
     x_court_id:     str = Header("court-1"),
     x_chip_temp:    str = Header(None),
     x_device_token: str = Header(None),
-    x_send_time:    str = Header(None),   # unix timestamp from camera
+    x_send_time:    str = Header(None),
 ):
     # AUTHENTICATION
     if x_device_token != DEVICE_TOKEN or not DEVICE_TOKEN:
@@ -153,7 +157,7 @@ async def court_photo(
     if len(body) < 1000:
         return JSONResponse({"error": "image too small"}, status_code=400)
 
-    arr    = np.frombuffer(body, dtype=np.uint8)
+    arr     = np.frombuffer(body, dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         return JSONResponse({"error": "decode failed"}, status_code=400)
@@ -163,8 +167,8 @@ async def court_photo(
     # --- METHOD 1 TIMING: measure inference ---
     inference_start = time.time()
     output = session.run(None, {input_name: img_in})
-    inference_end = time.time()
-    inference_time = inference_end - inference_start
+    inference_end   = time.time()
+    inference_time  = inference_end - inference_start
 
     detections   = postprocess(output, scale, top, left, img_bgr.shape)
     person_count = len(detections)
@@ -178,7 +182,7 @@ async def court_photo(
         print(f"[TIMING] Total camera→inference-done: {total_so_far:.3f}s")
 
     # Annotate with timestamp burned in
-    now = int(time.time())
+    now           = int(time.time())
     annotated_img = annotate(img_bgr, detections, x_court_id, now)
 
     if KEEP_LAST_PHOTO:
@@ -189,25 +193,79 @@ async def court_photo(
     # Save every photo if enabled
     SAVE_PHOTOS = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
     if SAVE_PHOTOS:
-        photos_dir = Path("photos") / x_court_id
+        photos_dir   = Path("photos") / x_court_id
         photos_dir.mkdir(parents=True, exist_ok=True)
         status_label = "occupied" if occupied else "free"
-        filename = f"{now}_{status_label}_{person_count}p.jpg"
+        # Tag pending confirmation shots in filename for easy review
+        in_confirm   = x_court_id in pending_free_confirm
+        confirm_tag  = "_PENDING" if (not occupied and in_confirm) else ""
+        filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}.jpg"
         ok, jpeg_bytes = cv2.imencode(".jpg", annotated_img)
         if ok:
             (photos_dir / filename).write_bytes(jpeg_bytes.tobytes())
 
-    status = load_status()
+    # ---- CONFIRMATION LOGIC: occupied→free requires 2 free readings ----
+    status       = load_status()
+    current      = status.get(x_court_id, {})
+    was_occupied = current.get("occupied", False)
+    chip_temp_val = float(x_chip_temp) if x_chip_temp else None
+
+    if not occupied:
+        if was_occupied:
+            # First "free" after "occupied" — start confirmation window
+            pending_free_confirm[x_court_id] = {"first_free_at": now}
+            print(f"  -> PENDING CONFIRM: first free reading for {x_court_id}, "
+                  f"holding status as occupied | temp={x_chip_temp}°C")
+            # Don't update status yet — return early keeping court as occupied
+            return {"ok": True, "occupied": False,
+                    "person_count": person_count,
+                    "status_updated": False,
+                    "message": "awaiting_confirmation"}
+
+        elif x_court_id in pending_free_confirm:
+            # Second "free" reading — check confirmation window
+            first_free_at    = pending_free_confirm[x_court_id]["first_free_at"]
+            time_since_first = now - first_free_at
+
+            if time_since_first <= CONFIRM_WINDOW_SECONDS:
+                # Confirmed free — clear pending and fall through to update
+                print(f"  -> CONFIRMED FREE for {x_court_id} "
+                      f"after {time_since_first}s | temp={x_chip_temp}°C")
+                del pending_free_confirm[x_court_id]
+                # Falls through to status update below
+
+            else:
+                # Confirmation window expired — restart confirmation
+                print(f"  -> CONFIRM WINDOW EXPIRED ({time_since_first}s) "
+                      f"for {x_court_id} — restarting | temp={x_chip_temp}°C")
+                pending_free_confirm[x_court_id] = {"first_free_at": now}
+                return {"ok": True, "occupied": False,
+                        "person_count": person_count,
+                        "status_updated": False,
+                        "message": "confirmation_window_expired_restarting"}
+        else:
+            # Already in free state — normal update, no confirmation needed
+            pass
+
+    else:
+        # Court is occupied — cancel any pending confirmation immediately
+        if x_court_id in pending_free_confirm:
+            print(f"  -> OCCUPIED again for {x_court_id} — "
+                  f"cancelling free confirmation | temp={x_chip_temp}°C")
+            del pending_free_confirm[x_court_id]
+
+    # Normal status update
+    # Reached for: occupied, confirmed free, or already-free→still-free
     status[x_court_id] = {
         "occupied":     occupied,
         "person_count": person_count,
         "updated_at":   now,
-        "chip_temp":    float(x_chip_temp) if x_chip_temp else None,
+        "chip_temp":    chip_temp_val,
     }
     save_status(status)
 
-    print(f"  -> occupied={occupied}, persons={person_count}, "
-          f"temp={x_chip_temp}, chip_temp_stored=True")
+    print(f"  -> STATUS UPDATED: occupied={occupied}, "
+          f"persons={person_count}, temp={x_chip_temp}°C")
 
     return {"ok": True, "occupied": occupied, "person_count": person_count}
 
@@ -223,26 +281,37 @@ def dashboard(token: str = ""):
         age   = int(time.time()) - s["updated_at"]
         color = "#d4edda" if s["occupied"] else "#f8d7da"
         has_photo = court in latest_photos
+
+        # Show confirmation pending state if applicable
+        confirm_note = ""
+        if court in pending_free_confirm:
+            elapsed = int(time.time()) - pending_free_confirm[court]["first_free_at"]
+            confirm_note = (f'<p style="color:orange;font-weight:bold;">'
+                            f'⏳ Confirming free status... ({elapsed}s elapsed, '
+                            f'max {CONFIRM_WINDOW_SECONDS}s)</p>')
+
         img_tag = (f'<img src="/latest/{court}?token={token}" '
                    f'style="max-width:600px;">') if has_photo else ""
+
         rows += f"""
         <div style="background:{color};padding:1em;margin:1em 0;border-radius:8px;">
           <h2>{court}: {"OCCUPIED" if s["occupied"] else "free"}</h2>
           <p>{s["person_count"]} person(s), {age}s ago</p>
           <p>Chip temp: {s.get("chip_temp", "N/A")}°C</p>
+          {confirm_note}
           {img_tag}
         </div>
         """
 
-    photos_path  = Path("photos")
-    saved_count  = (sum(1 for _ in photos_path.rglob("*.jpg"))
-                    if photos_path.exists() else 0)
-    saving_on    = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
-    save_line    = (f"<p><small>Photo saving: "
-                    f"{'ON' if saving_on else 'OFF'} — "
-                    f"{saved_count} photos saved | "
-                    f"<a href='/admin/photos/download.zip?token={token}'>"
-                    f"Download zip</a></small></p>")
+    photos_path = Path("photos")
+    saved_count = (sum(1 for _ in photos_path.rglob("*.jpg"))
+                   if photos_path.exists() else 0)
+    saving_on   = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
+    save_line   = (f"<p><small>Photo saving: "
+                   f"{'ON' if saving_on else 'OFF'} — "
+                   f"{saved_count} photos saved | "
+                   f"<a href='/admin/photos/download.zip?token={token}'>"
+                   f"Download zip</a></small></p>")
 
     html = f"""
     <html>
