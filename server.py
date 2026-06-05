@@ -28,7 +28,7 @@ KEEP_LAST_PHOTO = True
 # Tracks first "free" reading per court for occupied→free confirmation
 # Structure: {court_id: {"first_free_at": unix_timestamp}}
 pending_free_confirm = {}
-CONFIRM_WINDOW_SECONDS = 45  # two free readings within this window = confirmed
+CONFIRM_WINDOW_SECONDS = 180  # two free readings within this window = confirmed
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
