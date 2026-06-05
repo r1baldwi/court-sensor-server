@@ -21,14 +21,14 @@ ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 STATUS_FILE    = Path("status.json")
 MODEL_PATH     = Path("yolov8n.onnx")
 PERSON_CLASS   = 0
-CONF_THRESHOLD = 0.3
+CONF_THRESHOLD = 0.15
 KEEP_LAST_PHOTO = True
 
 # ---- Confirmation logic state ----
 # Tracks first "free" reading per court for occupied→free confirmation
 # Structure: {court_id: {"first_free_at": unix_timestamp}}
 pending_free_confirm = {}
-CONFIRM_WINDOW_SECONDS = 180  # two free readings within this window = confirmed
+CONFIRM_WINDOW_SECONDS = 45  # two free readings within this window = confirmed
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
@@ -61,6 +61,11 @@ def save_status(s):
 
 
 def preprocess(img_bgr):
+    # Crop to top 65% of frame — removes dead foreground court surface,
+    # effectively zooming in on the area where players actually appear.
+    h_full = img_bgr.shape[0]
+    img_bgr = img_bgr[:int(h_full * 0.65), :]
+
     h, w = img_bgr.shape[:2]
     scale = INPUT_SIZE / max(h, w)
     nh, nw = int(h * scale), int(w * scale)
@@ -397,6 +402,30 @@ def count_photos(token: str = ""):
         "by_court":       by_court,
         "saving_enabled": os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
     }
+
+
+@app.get("/admin/photos/clear")
+def clear_photos(token: str = ""):
+    if token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(401, "unauthorized")
+
+    photos_path = Path("photos")
+    if not photos_path.exists():
+        return {"ok": True, "deleted": 0, "message": "no photos directory found"}
+
+    deleted = 0
+    for photo_file in photos_path.rglob("*.jpg"):
+        photo_file.unlink()
+        deleted += 1
+
+    # Remove empty court subdirectories
+    for court_dir in photos_path.iterdir():
+        if court_dir.is_dir() and not any(court_dir.iterdir()):
+            court_dir.rmdir()
+
+    print(f"[ADMIN] Cleared {deleted} photos from disk")
+    return {"ok": True, "deleted": deleted,
+            "message": f"Deleted {deleted} photos. Directory structure preserved."}
 
 
 @app.get("/healthz")
