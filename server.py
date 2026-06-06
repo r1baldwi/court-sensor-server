@@ -19,7 +19,7 @@ ADMIN_TOKEN  = os.environ.get("ADMIN_TOKEN", "")
 
 # ---- Configuration ----
 STATUS_FILE    = Path("status.json")
-MODEL_PATH     = Path("yolov8n.onnx")
+MODEL_PATH     = Path("yolov8s.onnx")
 PERSON_CLASS   = 0
 CONF_THRESHOLD = 0.15
 KEEP_LAST_PHOTO = True
