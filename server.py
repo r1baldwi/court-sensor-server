@@ -25,10 +25,8 @@ CONF_THRESHOLD = 0.15
 KEEP_LAST_PHOTO = True
 
 # ---- Confirmation logic state ----
-# Tracks first "free" reading per court for occupied→free confirmation
-# Structure: {court_id: {"first_free_at": unix_timestamp}}
 pending_free_confirm = {}
-CONFIRM_WINDOW_SECONDS = 180  # two free readings within this window = confirmed
+CONFIRM_WINDOW_SECONDS = 180
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
@@ -58,6 +56,15 @@ def load_status():
 
 def save_status(s):
     STATUS_FILE.write_text(json.dumps(s, indent=2))
+
+
+def apply_clahe(img_bgr):
+    """Apply CLAHE contrast enhancement to boost visibility in dark/shadowed areas."""
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
 def preprocess(img_bgr):
@@ -112,14 +119,26 @@ def postprocess(output, scale, pad_top, pad_left, orig_shape):
     return [(boxes[i], float(person_scores[i])) for i in keep_idx]
 
 
-def annotate(img_bgr, detections, court_id="", timestamp=None):
+def run_inference(img_bgr):
+    """Run YOLO inference on an image. Returns (detections, person_count, occupied)."""
+    img_in, scale, top, left = preprocess(img_bgr)
+    output     = session.run(None, {input_name: img_in})
+    detections = postprocess(output, scale, top, left, img_bgr.shape)
+    person_count = len(detections)
+    return detections, person_count, person_count > 0
+
+
+def annotate(img_bgr, detections, court_id="", timestamp=None, clahe_used=False):
     out = img_bgr.copy()
 
     if timestamp:
         ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
-        cv2.putText(out, f"{court_id} | {ts_str}", (10, 25),
+        label  = f"{court_id} | {ts_str}"
+        if clahe_used:
+            label += " [CLAHE]"
+        cv2.putText(out, label, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
-        cv2.putText(out, f"{court_id} | {ts_str}", (10, 25),
+        cv2.putText(out, label, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
     for (box, score) in detections:
@@ -142,7 +161,7 @@ async def court_photo(
     if x_device_token != DEVICE_TOKEN or not DEVICE_TOKEN:
         raise HTTPException(401, "unauthorized")
 
-    # --- METHOD 1 TIMING: log receive time ---
+    # --- TIMING: log receive time ---
     receive_time = time.time()
     send_time    = float(x_send_time) if x_send_time else None
 
@@ -166,41 +185,56 @@ async def court_photo(
     if img_bgr is None:
         return JSONResponse({"error": "decode failed"}, status_code=400)
 
-    img_in, scale, top, left = preprocess(img_bgr)
-
-    # --- METHOD 1 TIMING: measure inference ---
+    # ---- PASS 1: standard inference ----
     inference_start = time.time()
-    output = session.run(None, {input_name: img_in})
-    inference_end   = time.time()
-    inference_time  = inference_end - inference_start
-
-    detections   = postprocess(output, scale, top, left, img_bgr.shape)
-    person_count = len(detections)
-    occupied     = person_count > 0
-
-    print(f"[TIMING] Inference: {inference_time:.3f}s | "
+    detections, person_count, occupied = run_inference(img_bgr)
+    inference_end = time.time()
+    print(f"[INFERENCE] Pass 1 | {inference_end - inference_start:.3f}s | "
           f"occupied={occupied}, persons={person_count}")
 
+    clahe_used = False
+
+    # ---- PASS 2: CLAHE enhancement if no person detected ----
+    if not occupied:
+        print(f"[CLAHE] No person detected on pass 1 — applying CLAHE for pass 2")
+        clahe_start = time.time()
+        img_clahe   = apply_clahe(img_bgr)
+        detections_clahe, person_count_clahe, occupied_clahe = run_inference(img_clahe)
+        clahe_end   = time.time()
+        print(f"[CLAHE] Pass 2 | {clahe_end - clahe_start:.3f}s | "
+              f"occupied={occupied_clahe}, persons={person_count_clahe}")
+
+        if occupied_clahe:
+            print(f"[CLAHE] ✓ CLAHE rescued detection for {x_court_id} — "
+                  f"{person_count_clahe} person(s) found on pass 2")
+            detections  = detections_clahe
+            person_count = person_count_clahe
+            occupied    = True
+            clahe_used  = True
+        else:
+            print(f"[CLAHE] No person detected on pass 2 either — reporting free")
+
     if send_time:
-        total_so_far = inference_end - send_time
+        total_so_far = time.time() - send_time
         print(f"[TIMING] Total camera→inference-done: {total_so_far:.3f}s")
 
-    # Annotate with timestamp burned in
+    # Annotate original image (note [CLAHE] in label if pass 2 detected)
     now           = int(time.time())
-    annotated_img = annotate(img_bgr, detections, x_court_id, now)
+    annotated_img = annotate(img_bgr, detections, x_court_id, now, clahe_used)
 
     if KEEP_LAST_PHOTO:
         ok, jpeg_bytes = cv2.imencode(".jpg", annotated_img)
         if ok:
             latest_photos[x_court_id] = jpeg_bytes.tobytes()
 
-    # Save every photo if enabled
+    # Save photos if enabled
     SAVE_PHOTOS = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
     if SAVE_PHOTOS:
         status_label = "occupied" if occupied else "free"
         in_confirm   = x_court_id in pending_free_confirm
         confirm_tag  = "_PENDING" if (not occupied and in_confirm) else ""
-        filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}.jpg"
+        clahe_tag    = "_CLAHE" if clahe_used else ""
+        filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}{clahe_tag}.jpg"
 
         # Save raw (clean input for replay testing)
         raw_dir = Path("photos") / x_court_id / "raw"
@@ -223,21 +257,15 @@ async def court_photo(
     chip_temp_val = float(x_chip_temp) if x_chip_temp else None
 
     if not occupied:
-        # Check for existing pending confirmation FIRST
         if x_court_id in pending_free_confirm:
-            # We already have a pending confirmation — this is the second+ free reading
             first_free_at    = pending_free_confirm[x_court_id]["first_free_at"]
             time_since_first = now - first_free_at
 
             if time_since_first <= CONFIRM_WINDOW_SECONDS:
-                # Confirmed free — clear pending and update status
                 print(f"  -> CONFIRMED FREE for {x_court_id} "
                       f"after {time_since_first}s | temp={x_chip_temp}°C")
                 del pending_free_confirm[x_court_id]
-                # Falls through to status update below
-
             else:
-                # Confirmation window expired — restart
                 print(f"  -> CONFIRM WINDOW EXPIRED ({time_since_first}s) "
                       f"for {x_court_id} — restarting | temp={x_chip_temp}°C")
                 pending_free_confirm[x_court_id] = {"first_free_at": now}
@@ -247,7 +275,6 @@ async def court_photo(
                         "message": "confirmation_window_expired_restarting"}
 
         elif was_occupied:
-            # First "free" after "occupied" — start confirmation window
             pending_free_confirm[x_court_id] = {"first_free_at": now}
             print(f"  -> PENDING CONFIRM: first free reading for {x_court_id}, "
                   f"holding status as occupied | temp={x_chip_temp}°C")
@@ -255,13 +282,10 @@ async def court_photo(
                     "person_count": person_count,
                     "status_updated": False,
                     "message": "awaiting_confirmation"}
-
         else:
-            # Already in free state — normal update
             pass
 
     else:
-        # Court is occupied — cancel any pending confirmation immediately
         if x_court_id in pending_free_confirm:
             print(f"  -> OCCUPIED again for {x_court_id} — "
                   f"cancelling free confirmation | temp={x_chip_temp}°C")
@@ -277,9 +301,11 @@ async def court_photo(
     save_status(status)
 
     print(f"  -> STATUS UPDATED: occupied={occupied}, "
-          f"persons={person_count}, temp={x_chip_temp}°C")
+          f"persons={person_count}, temp={x_chip_temp}°C"
+          f"{' [CLAHE]' if clahe_used else ''}")
 
-    return {"ok": True, "occupied": occupied, "person_count": person_count}
+    return {"ok": True, "occupied": occupied, "person_count": person_count,
+            "clahe_used": clahe_used}
 
 
 @app.get("/")
@@ -294,7 +320,6 @@ def dashboard(token: str = ""):
         color = "#d4edda" if s["occupied"] else "#f8d7da"
         has_photo = court in latest_photos
 
-        # Show confirmation pending state if applicable
         confirm_note = ""
         if court in pending_free_confirm:
             elapsed = int(time.time()) - pending_free_confirm[court]["first_free_at"]
@@ -400,7 +425,7 @@ def count_photos(token: str = ""):
     total    = 0
     for court_dir in photos_path.iterdir():
         if court_dir.is_dir():
-            count = sum(1 for _ in court_dir.glob("*.jpg"))
+            count = sum(1 for _ in court_dir.rglob("*.jpg"))
             by_court[court_dir.name] = count
             total += count
 
@@ -425,7 +450,6 @@ def clear_photos(token: str = ""):
         photo_file.unlink()
         deleted += 1
 
-    # Remove empty court subdirectories
     for court_dir in photos_path.iterdir():
         if court_dir.is_dir() and not any(court_dir.iterdir()):
             court_dir.rmdir()
