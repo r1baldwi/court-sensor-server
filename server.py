@@ -61,10 +61,9 @@ def save_status(s):
 
 
 def preprocess(img_bgr):
-    # Crop to top 65% of frame — removes dead foreground court surface,
-    # effectively zooming in on the area where players actually appear.
+    # Keep rows 15% to 70% — removes sky on top AND foreground on bottom
     h_full = img_bgr.shape[0]
-    img_bgr = img_bgr[:int(h_full * 0.65), :]
+    img_bgr = img_bgr[int(h_full * 0.15):int(h_full * 0.70), :]
 
     h, w = img_bgr.shape[:2]
     scale = INPUT_SIZE / max(h, w)
