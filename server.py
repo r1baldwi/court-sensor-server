@@ -198,24 +198,24 @@ async def court_photo(
     # Save every photo if enabled
     SAVE_PHOTOS = os.environ.get("SAVE_PHOTOS", "false").lower() == "true"
     if SAVE_PHOTOS:
-    status_label = "occupied" if occupied else "free"
-    in_confirm   = x_court_id in pending_free_confirm
-    confirm_tag  = "_PENDING" if (not occupied and in_confirm) else ""
-    filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}.jpg"
+        status_label = "occupied" if occupied else "free"
+        in_confirm   = x_court_id in pending_free_confirm
+        confirm_tag  = "_PENDING" if (not occupied and in_confirm) else ""
+        filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}.jpg"
 
-    # Save raw (clean input for replay testing)
-    raw_dir = Path("photos") / x_court_id / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    ok_raw, raw_bytes = cv2.imencode(".jpg", img_bgr)
-    if ok_raw:
-        (raw_dir / filename).write_bytes(raw_bytes.tobytes())
+        # Save raw (clean input for replay testing)
+        raw_dir = Path("photos") / x_court_id / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        ok_raw, raw_bytes = cv2.imencode(".jpg", img_bgr)
+        if ok_raw:
+            (raw_dir / filename).write_bytes(raw_bytes.tobytes())
 
-    # Save annotated (for admin dashboard review)
-    ann_dir = Path("photos") / x_court_id / "annotated"
-    ann_dir.mkdir(parents=True, exist_ok=True)
-    ok_ann, ann_bytes = cv2.imencode(".jpg", annotated_img)
-    if ok_ann:
-        (ann_dir / filename).write_bytes(ann_bytes.tobytes())
+        # Save annotated (for admin dashboard review)
+        ann_dir = Path("photos") / x_court_id / "annotated"
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        ok_ann, ann_bytes = cv2.imencode(".jpg", annotated_img)
+        if ok_ann:
+            (ann_dir / filename).write_bytes(ann_bytes.tobytes())
 
     # ---- CONFIRMATION LOGIC: occupied→free requires 2 free readings ----
     status       = load_status()
