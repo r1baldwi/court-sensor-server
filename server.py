@@ -297,11 +297,22 @@ async def court_photo(
             del pending_free_confirm[x_court_id]
 
     # Normal status update
+    was_occupied_before = current.get("occupied", False)
+
+    # Only set occupied_since on transition to occupied, preserve it while staying occupied
+    if occupied and not was_occupied_before:
+        occupied_since = now
+    elif occupied and was_occupied_before:
+        occupied_since = current.get("occupied_since", now)
+    else:
+        occupied_since = None
+
     status[x_court_id] = {
-        "occupied":     occupied,
-        "person_count": person_count,
-        "updated_at":   now,
-        "chip_temp":    chip_temp_val,
+        "occupied":        occupied,
+        "person_count":    person_count,
+        "updated_at":      now,
+        "chip_temp":       chip_temp_val,
+        "occupied_since":  occupied_since,
     }
     save_status(status)
 
@@ -310,7 +321,7 @@ async def court_photo(
           f"{' [CLAHE]' if clahe_used else ''}")
 
     return {"ok": True, "occupied": occupied, "person_count": person_count,
-            "clahe_used": clahe_used}
+            "occupied_since": occupied_since, "clahe_used": clahe_used}
 
 
 @app.get("/")
