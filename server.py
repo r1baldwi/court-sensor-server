@@ -70,7 +70,8 @@ def apply_clahe(img_bgr):
 def preprocess(img_bgr):
     # Keep rows 15% to 70% — removes sky on top AND foreground on bottom
     h_full = img_bgr.shape[0]
-    img_bgr = img_bgr[int(h_full * 0.15):int(h_full * 0.70), :]
+    crop_top_px = int(h_full * 0.15)
+    img_bgr = img_bgr[crop_top_px:int(h_full * 0.70), :]
 
     h, w = img_bgr.shape[:2]
     scale = INPUT_SIZE / max(h, w)
@@ -82,10 +83,10 @@ def preprocess(img_bgr):
     canvas[top:top + nh, left:left + nw] = resized
     img = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     img = img.transpose(2, 0, 1)[None]
-    return img, scale, top, left
+    return img, scale, top, left, crop_top_px
 
 
-def postprocess(output, scale, pad_top, pad_left, orig_shape):
+def postprocess(output, scale, pad_top, pad_left, orig_shape, crop_top_px=0):
     pred = output[0][0].transpose()
     boxes_xywh   = pred[:, :4]
     class_scores = pred[:, 4:]
@@ -102,9 +103,13 @@ def postprocess(output, scale, pad_top, pad_left, orig_shape):
     x2 = cx + w / 2;  y2 = cy + h / 2
     boxes = np.stack([x1, y1, x2, y2], axis=1)
 
+    # Remove letterbox padding offset
     boxes[:, [0, 2]] -= pad_left
     boxes[:, [1, 3]] -= pad_top
     boxes /= scale
+
+    # Add back the crop offset so coordinates are in original image space
+    boxes[:, [1, 3]] += crop_top_px
 
     H, W = orig_shape[:2]
     boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, W)
@@ -121,9 +126,9 @@ def postprocess(output, scale, pad_top, pad_left, orig_shape):
 
 def run_inference(img_bgr):
     """Run YOLO inference on an image. Returns (detections, person_count, occupied)."""
-    img_in, scale, top, left = preprocess(img_bgr)
+    img_in, scale, top, left, crop_top_px = preprocess(img_bgr)
     output     = session.run(None, {input_name: img_in})
-    detections = postprocess(output, scale, top, left, img_bgr.shape)
+    detections = postprocess(output, scale, top, left, img_bgr.shape, crop_top_px)
     person_count = len(detections)
     return detections, person_count, person_count > 0
 
