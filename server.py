@@ -26,7 +26,7 @@ KEEP_LAST_PHOTO = True
 
 # ---- Confirmation logic state ----
 pending_free_confirm = {}
-CONFIRM_WINDOW_SECONDS = 180
+CONFIRM_WINDOW_SECONDS = 250  # two free readings within this window = confirmed
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
@@ -133,14 +133,40 @@ def run_inference(img_bgr):
     return detections, person_count, person_count > 0
 
 
-def annotate(img_bgr, detections, court_id="", timestamp=None, clahe_used=False):
+def run_inference_strip(img_bgr, strip_top=0.35, strip_bottom=0.65):
+    """Run YOLO inference on a mid-court horizontal strip for bench detection."""
+    h_full = img_bgr.shape[0]
+    crop_top_px  = int(h_full * strip_top)
+    crop_bottom_px = int(h_full * strip_bottom)
+    img_strip = img_bgr[crop_top_px:crop_bottom_px, :]
+
+    h, w = img_strip.shape[:2]
+    scale = INPUT_SIZE / max(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    resized = cv2.resize(img_strip, (nw, nh))
+    canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), 114, dtype=np.uint8)
+    pad_top  = (INPUT_SIZE - nh) // 2
+    pad_left = (INPUT_SIZE - nw) // 2
+    canvas[pad_top:pad_top + nh, pad_left:pad_left + nw] = resized
+    img = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    img = img.transpose(2, 0, 1)[None]
+
+    output     = session.run(None, {input_name: img})
+    detections = postprocess(output, scale, pad_top, pad_left, img_bgr.shape, crop_top_px)
+    person_count = len(detections)
+    return detections, person_count, person_count > 0
+
+
+
+
+def annotate(img_bgr, detections, court_id="", timestamp=None, fallback_used=False):
     out = img_bgr.copy()
 
     if timestamp:
         ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
         label  = f"{court_id} | {ts_str}"
-        if clahe_used:
-            label += " [CLAHE]"
+        if fallback_used:
+            label += " [FALLBACK]"
         cv2.putText(out, label, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
         cv2.putText(out, label, (10, 25),
@@ -197,7 +223,8 @@ async def court_photo(
     print(f"[INFERENCE] Pass 1 | {inference_end - inference_start:.3f}s | "
           f"occupied={occupied}, persons={person_count}")
 
-    clahe_used = False
+    clahe_used  = False
+    bench_used  = False
 
     # ---- PASS 2: CLAHE enhancement if no person detected ----
     if not occupied:
@@ -217,15 +244,34 @@ async def court_photo(
             occupied    = True
             clahe_used  = True
         else:
-            print(f"[CLAHE] No person detected on pass 2 either — reporting free")
+            print(f"[CLAHE] No person detected on pass 2 either — trying bench strip pass 3")
+
+            # ---- PASS 3: mid-court strip for bench detection ----
+            bench_start = time.time()
+            detections_bench, person_count_bench, occupied_bench = run_inference_strip(img_bgr)
+            bench_end   = time.time()
+            print(f"[BENCH] Pass 3 | {bench_end - bench_start:.3f}s | "
+                  f"occupied={occupied_bench}, persons={person_count_bench}")
+
+            if occupied_bench:
+                print(f"[BENCH] ✓ Bench strip rescued detection for {x_court_id} — "
+                      f"{person_count_bench} person(s) found on pass 3")
+                detections   = detections_bench
+                person_count = person_count_bench
+                occupied     = True
+                bench_used   = True
+            else:
+                print(f"[BENCH] No person detected on pass 3 either — reporting free")
 
     if send_time:
         total_so_far = time.time() - send_time
         print(f"[TIMING] Total camera→inference-done: {total_so_far:.3f}s")
 
-    # Annotate original image (note [CLAHE] in label if pass 2 detected)
+    # Annotate original image (note [CLAHE] or [BENCH] in label if pass 2/3 detected)
+    pass_label = "[CLAHE]" if clahe_used else "[BENCH]" if bench_used else ""
     now           = int(time.time())
-    annotated_img = annotate(img_bgr, detections, x_court_id, now, clahe_used)
+    annotated_img = annotate(img_bgr, detections, x_court_id, now,
+                             clahe_used or bench_used)
 
     if KEEP_LAST_PHOTO:
         ok, jpeg_bytes = cv2.imencode(".jpg", annotated_img)
@@ -238,7 +284,7 @@ async def court_photo(
         status_label = "occupied" if occupied else "free"
         in_confirm   = x_court_id in pending_free_confirm
         confirm_tag  = "_PENDING" if (not occupied and in_confirm) else ""
-        clahe_tag    = "_CLAHE" if clahe_used else ""
+        clahe_tag    = "_CLAHE" if clahe_used else "_BENCH" if bench_used else ""
         filename     = f"{now}_{status_label}_{person_count}p{confirm_tag}{clahe_tag}.jpg"
 
         # Save raw (clean input for replay testing)
@@ -316,12 +362,13 @@ async def court_photo(
     }
     save_status(status)
 
+    pass_tag = " [CLAHE]" if clahe_used else " [BENCH]" if bench_used else ""
     print(f"  -> STATUS UPDATED: occupied={occupied}, "
-          f"persons={person_count}, temp={x_chip_temp}°C"
-          f"{' [CLAHE]' if clahe_used else ''}")
+          f"persons={person_count}, temp={x_chip_temp}°C{pass_tag}")
 
     return {"ok": True, "occupied": occupied, "person_count": person_count,
-            "occupied_since": occupied_since, "clahe_used": clahe_used}
+            "occupied_since": occupied_since, "clahe_used": clahe_used,
+            "bench_used": bench_used}
 
 
 @app.get("/")
